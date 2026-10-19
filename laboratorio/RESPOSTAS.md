@@ -1,25 +1,5 @@
 # Respostas — Laboratório de Upload de Arquivos
 
-## O que foi implementado
-
-| Item | Onde |
-|---|---|
-| Migração `0002`: coluna `hash_sha256` + índice | `migrations/versions/0002_adiciona_hash_sha256.py` |
-| Hash SHA-256 no upload do caso 1 | `app/main.py` (`caso1_upload`) |
-| Desafio da Atividade 6: migração `0003` com `CHECK (status IN ('pendente','concluido'))` | `migrations/versions/0003_restringe_status.py` |
-| Extra 1: caso 3 aceita só `image/png`, `image/jpeg` e `application/pdf` (senão 415) | `app/main.py` (`caso3_gerar_link`) |
-| Extra 2: `DELETE /arquivos/{id}` apaga do banco e do RustFS | `app/main.py` (`apagar_arquivo`) |
-| Extra 3: `DELETE /caso3/pendentes-expirados` remove pendentes com mais de 10 min | `app/main.py` |
-| Extra 4: página HTML com o fluxo do caso 3 em `http://localhost:8000/pagina` + CORS no bucket | `frontend/index.html`, `lifespan` em `app/main.py` |
-| Extra 5: script que mede o tempo dos casos 1 e 3 | `clientes/medicao.py` |
-
-Observações:
-- Por causa do extra 1, o caso 3 não aceita mais `.txt`. Use `arquivos-teste/web.pdf` com `"content_type": "application/pdf"`.
-- Como agora existe a `0003`, um único `alembic downgrade -1` (Atividade 6.4) remove só o CHECK. Para remover a coluna de hash, rode `alembic downgrade 0001`.
-- O caso 1 tem limite de 10 MB. Para medir com 50 MB, suba a API com `TAMANHO_MAXIMO_MB=100 uvicorn app.main:app --reload`.
-
----
-
 ## Atividade 1 — Upload via API
 
 **Os bytes passaram por quantos lugares?**
