@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: lab_postgres
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab_upload
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: lab_rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: labaluno
+      RUSTFS_SECRET_KEY: labaluno-segredo-123
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    command: /data
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console web
+    volumes:
+      - rustfs_data:/data
+
+volumes:
+  pg_data:
+  rustfs_data:
