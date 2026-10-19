@@ -8,7 +8,11 @@ Casos:
       API guarda só os metadados no Postgres
   4 - API gera link assinado de DOWNLOAD (presigned GET) com validade curta
   5 - Auditoria: compara o que existe no banco com o que existe no bucket
+
+Extras: validação de tipo no caso 3, DELETE /arquivos/{id}, limpeza de
+pendentes expirados e uma página HTML (GET /pagina) que usa o fluxo do caso 3.
 """
+import hashlib
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -18,7 +22,7 @@ import psycopg
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -29,7 +33,10 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://localhost:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "labaluno")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "labaluno-segredo-123")
 BUCKET = os.getenv("S3_BUCKET", "uploads")
-TAMANHO_MAXIMO = 10 * 1024 * 1024  # 10 MB (limite do caso 1)
+TAMANHO_MAXIMO = int(os.getenv("TAMANHO_MAXIMO_MB", "10")) * 1024 * 1024  # limite do caso 1
+TIPOS_PERMITIDOS_CASO3 = {"image/png", "image/jpeg", "application/pdf"}
+MINUTOS_PARA_EXPIRAR_PENDENTE = 10
+PAGINA_HTML = os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html")
 
 s3 = boto3.client(
     "s3",
@@ -71,6 +78,19 @@ async def lifespan(app: FastAPI):
         s3.head_bucket(Bucket=BUCKET)
     except ClientError:
         s3.create_bucket(Bucket=BUCKET)
+    # CORS no bucket: sem isso o navegador bloqueia o PUT da página /pagina
+    try:
+        s3.put_bucket_cors(
+            Bucket=BUCKET,
+            CORSConfiguration={"CORSRules": [{
+                "AllowedOrigins": ["http://localhost:8000", "http://127.0.0.1:8000"],
+                "AllowedMethods": ["PUT", "GET"],
+                "AllowedHeaders": ["*"],
+                "MaxAgeSeconds": 3000,
+            }]},
+        )
+    except ClientError as erro:
+        print(f"Aviso: não foi possível configurar CORS no bucket ({erro})")
     yield
 
 
@@ -103,7 +123,8 @@ def listar_arquivos():
 def caso1_upload(arquivo: UploadFile = File(...)):
     conteudo = arquivo.file.read()
     if len(conteudo) > TAMANHO_MAXIMO:
-        raise HTTPException(413, "Arquivo maior que 10 MB")
+        raise HTTPException(413, f"Arquivo maior que {TAMANHO_MAXIMO // (1024 * 1024)} MB")
+    hash_sha256 = hashlib.sha256(conteudo).hexdigest()
 
     chave = nova_chave("caso1", arquivo.filename)
     content_type = arquivo.content_type or "application/octet-stream"
@@ -114,12 +135,13 @@ def caso1_upload(arquivo: UploadFile = File(...)):
     # 2) grava no Postgres (metadados + os próprios bytes)
     with db() as conn:
         (novo_id,) = conn.execute(
-            "INSERT INTO arquivos (caso, nome, content_type, tamanho, chave_objeto, conteudo) "
-            "VALUES ('caso1', %s, %s, %s, %s, %s) RETURNING id",
-            (arquivo.filename, content_type, len(conteudo), chave, conteudo),
+            "INSERT INTO arquivos (caso, nome, content_type, tamanho, chave_objeto, conteudo, hash_sha256) "
+            "VALUES ('caso1', %s, %s, %s, %s, %s, %s) RETURNING id",
+            (arquivo.filename, content_type, len(conteudo), chave, conteudo, hash_sha256),
         ).fetchone()
 
-    return {"id": novo_id, "nome": arquivo.filename, "tamanho": len(conteudo), "chave_objeto": chave}
+    return {"id": novo_id, "nome": arquivo.filename, "tamanho": len(conteudo),
+            "chave_objeto": chave, "hash_sha256": hash_sha256}
 
 
 @app.get("/caso1/arquivos/{arquivo_id}/do-banco")
@@ -157,6 +179,10 @@ class PedidoLink(BaseModel):
 
 @app.post("/caso3/gerar-link")
 def caso3_gerar_link(pedido: PedidoLink):
+    if pedido.content_type not in TIPOS_PERMITIDOS_CASO3:
+        raise HTTPException(
+            415, f"Tipo não permitido. Aceitos: {', '.join(sorted(TIPOS_PERMITIDOS_CASO3))}"
+        )
     chave = nova_chave("caso3", pedido.nome)
 
     with db() as conn:
@@ -199,6 +225,45 @@ def caso3_confirmar(arquivo_id: int):
             (info["ContentLength"], arquivo_id),
         )
     return {"id": arquivo_id, "status": "concluido", "tamanho": info["ContentLength"]}
+
+
+@app.delete("/caso3/pendentes-expirados")
+def caso3_remover_pendentes_expirados():
+    """Remove registros 'pendente' com mais de 10 minutos (e o objeto, se o PUT chegou a ser feito)."""
+    with db() as conn:
+        with conn.transaction():
+            linhas = conn.execute(
+                "DELETE FROM arquivos WHERE status = 'pendente' "
+                "AND criado_em < now() - make_interval(mins => %s) "
+                "RETURNING id, chave_objeto",
+                (MINUTOS_PARA_EXPIRAR_PENDENTE,),
+            ).fetchall()
+            for _, chave in linhas:
+                s3.delete_object(Bucket=BUCKET, Key=chave)
+    return {"removidos": [l[0] for l in linhas]}
+
+
+@app.get("/pagina")
+def pagina_caso3():
+    """Página HTML que faz o fluxo do caso 3 pelo navegador."""
+    return FileResponse(PAGINA_HTML)
+
+
+# ---------------------------------------------------------------------------
+# Limpeza - apaga do banco E do RustFS
+# ---------------------------------------------------------------------------
+@app.delete("/arquivos/{arquivo_id}")
+def apagar_arquivo(arquivo_id: int):
+    # A transação garante que, se o RustFS falhar, o registro volta (rollback).
+    with db() as conn:
+        with conn.transaction():
+            linha = conn.execute(
+                "DELETE FROM arquivos WHERE id = %s RETURNING chave_objeto", (arquivo_id,)
+            ).fetchone()
+            if not linha:
+                raise HTTPException(404, "Registro não encontrado")
+            s3.delete_object(Bucket=BUCKET, Key=linha[0])
+    return {"id": arquivo_id, "apagado": True}
 
 
 # ---------------------------------------------------------------------------

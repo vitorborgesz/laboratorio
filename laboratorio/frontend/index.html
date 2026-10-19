@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Upload com link assinado</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    button { padding: .5rem 1rem; margin-top: 1rem; }
+    pre { background: #f4f4f4; padding: 1rem; white-space: pre-wrap; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>Caso 3 no navegador</h1>
+  <p>Os bytes vão direto para o RustFS. A API só gera o link e confirma o upload.</p>
+
+  <input type="file" id="arquivo" accept="image/png,image/jpeg,application/pdf">
+  <br>
+  <button id="enviar">Enviar</button>
+
+  <pre id="log"></pre>
+
+  <script>
+    const log = (msg) => { document.getElementById("log").textContent += msg + "\n"; };
+
+    document.getElementById("enviar").addEventListener("click", async () => {
+      const arquivo = document.getElementById("arquivo").files[0];
+      if (!arquivo) { log("Escolha um arquivo."); return; }
+      document.getElementById("log").textContent = "";
+
+      try {
+        // 1) pedir o link à API
+        const respLink = await fetch("/caso3/gerar-link", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ nome: arquivo.name, content_type: arquivo.type || "application/octet-stream" }),
+        });
+        const link = await respLink.json();
+        if (!respLink.ok) { log(`1) Erro ${respLink.status}: ${link.detail}`); return; }
+        log(`1) Link recebido (id ${link.id})`);
+
+        // 2) PUT direto no RustFS (precisa de CORS configurado no bucket)
+        const put = await fetch(link.url_upload, {
+          method: "PUT",
+          headers: link.headers_obrigatorios,
+          body: arquivo,
+        });
+        log(`2) PUT no RustFS -> ${put.status}`);
+        if (!put.ok) return;
+
+        // 3) confirmar na API
+        const conf = await fetch(`/caso3/confirmar/${link.id}`, { method: "POST" });
+        log(`3) Confirmação -> ${conf.status} ${JSON.stringify(await conf.json())}`);
+      } catch (erro) {
+        log(`Falhou: ${erro}. Se foi no passo 2, verifique o CORS do bucket (console do navegador, F12).`);
+      }
+    });
+  </script>
+</body>
+</html>
